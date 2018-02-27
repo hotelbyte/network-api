@@ -10,6 +10,7 @@ import org.web3j.protocol.core.DefaultBlockParameter
 import org.web3j.protocol.core.DefaultBlockParameterName
 import org.web3j.protocol.core.methods.response.EthBlock
 import org.web3j.protocol.core.methods.response.TransactionReceipt
+import java.lang.Exception
 import java.math.BigInteger
 import java.time.Duration
 import java.time.LocalDateTime
@@ -46,7 +47,7 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
         val transaction = TransactionDto(hash, sender)
         updateAccountInfo(account, null, transaction, "account", firstSeen)
         if (transactionReceipt != null) {
-            if (transactionReceipt.contractAddress != null) {
+                if (transactionReceipt.contractAddress != null) {
                 // Save this address like a contract address
                 updateAccountInfo(transactionReceipt.contractAddress, null, transaction, "contract", firstSeen)
             }
@@ -68,18 +69,23 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
         web3Client.replayTransactionsObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0)),
                 DefaultBlockParameter.valueOf(lastBlock.blockNumber)).subscribe({
 
-            val txReceiptResult = web3Client.ethGetTransactionReceipt(it.hash).sendAsync().get()
-            var transactionReceipt: TransactionReceipt? = null
-            if (txReceiptResult != null && txReceiptResult.transactionReceipt != null) {
-                transactionReceipt = txReceiptResult.transactionReceipt.get()
+            try {
+                val txReceiptResult = web3Client.ethGetTransactionReceipt(it.hash).sendAsync().get()
+                var transactionReceipt: TransactionReceipt? = null
+                if (txReceiptResult != null && txReceiptResult.transactionReceipt != null) {
+                    transactionReceipt = txReceiptResult.transactionReceipt.get()
+                }
+
+                val timestampBlock = web3Client.ethGetBlockByHash(it.blockHash, false).sendAsync().get().block.timestamp
+                // pass receipt only with the sender of the transaction
+                updateFromTransaction(it.from, it.hash, true, transactionReceipt, timestampBlock)
+                if (it.to != null) {
+                    updateFromTransaction(it.to, it.hash, false, null, timestampBlock)
+                }
+                logTotalTime(now, it.blockNumber, lastBlock.blockNumber, "from transactions")
+            } catch (e:Exception) {
+                logger.error("Tx error: ",e)
             }
-
-            val timestampBlock = web3Client.ethGetBlockByHash(it.blockHash, false).sendAsync().get().block.timestamp
-            // pass receipt only with the sender of the transaction
-            updateFromTransaction(it.from, it.hash, true, transactionReceipt, timestampBlock)
-            updateFromTransaction(it.to, it.hash, false, null, timestampBlock)
-
-            logTotalTime(now, it.blockNumber, lastBlock.blockNumber, "from transactions")
         })
 
         // Find all the blocks
@@ -98,15 +104,17 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
      * Find account page from Redis
      */
     fun findAccountPage(pages: Pages, response: HttpServerResponse) {
-        _redisClient.redis?.zrange("accounts:sorted", pages.from, pages.to, { asyncResult ->
-            if (!asyncResult.succeeded()) {
-                logger.error(asyncResult.cause())
-            }
-            if (asyncResult.result() != null) {
-                response.end(Gson().toJson(asyncResult.result()))
-            } else {
-                response.end("[]")
-            }
+        synchronized(this, {
+            _redisClient.redis?.zrange("accounts:sorted", pages.from, pages.to, { asyncResult ->
+                if (!asyncResult.succeeded()) {
+                    logger.error(asyncResult.cause())
+                }
+                if (asyncResult.result() != null) {
+                    response.end(Gson().toJson(asyncResult.result()))
+                } else {
+                    response.end("[]")
+                }
+            })
         })
     }
 
@@ -114,16 +122,18 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
      * Counts the sorted list
      */
     fun getTotal(response: HttpServerResponse) {
-        _redisClient.redis?.zcount("accounts:sorted", Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, { asyncResult ->
-            if (!asyncResult.succeeded()) {
-                logger.error(asyncResult.cause())
-            }
+        synchronized(this, {
+            _redisClient.redis?.zcount("accounts:sorted", Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, { asyncResult ->
+                if (!asyncResult.succeeded()) {
+                    logger.error(asyncResult.cause())
+                }
 
-            if (asyncResult.result() != null) {
-                response.end(Gson().toJson(asyncResult.result()))
-            } else {
-                response.end("[]")
-            }
+                if (asyncResult.result() != null) {
+                    response.end(Gson().toJson(asyncResult.result()))
+                } else {
+                    response.end("[]")
+                }
+            })
         })
     }
 
@@ -131,16 +141,18 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
      * Get a single account with details
      */
     fun getAccount(account: String, response: HttpServerResponse) {
-        _redisClient.redis?.hget("accounts:detailed", account, { asyncResult ->
-            if (!asyncResult.succeeded()) {
-                logger.error(asyncResult.cause())
-            }
+        synchronized(this, {
+            _redisClient.redis?.hget("accounts:detailed", account, { asyncResult ->
+                if (!asyncResult.succeeded()) {
+                    logger.error(asyncResult.cause())
+                }
 
-            if (asyncResult.result() != null) {
-                response.end(asyncResult.result())
-            } else {
-                response.end("[]")
-            }
+                if (asyncResult.result() != null) {
+                    response.end(asyncResult.result())
+                } else {
+                    response.end("[]")
+                }
+            })
         })
     }
 
@@ -153,58 +165,62 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
                                   type: String,
                                   firstSeen: BigInteger) {
 
-        // First get current balance
-        val ethGetBalance = web3Client.ethGetBalance(account, DefaultBlockParameterName.LATEST).sendAsync().get()
-
-        val gson = Gson()
-
-        // Find accountDto, add block mined and update balance
-        _redisClient.redis?.hget("accounts:detailed", account, { record ->
-            if (!record.succeeded()) {
-                logger.error(record.cause())
-            }
-
-            val accountDto: AccountDto?
-            if (record.result() != null) {
-                accountDto = gson.fromJson(record.result(), AccountDto::class.java)
-                if (blockNumber != null && !accountDto.blocksMined.contains(blockNumber)) {
-                    accountDto.blocksMined.add(blockNumber)
+        synchronized(this, {
+            val gson = Gson()
+            // Find accountDto, add block mined and update balance
+            _redisClient.redis?.hget("accounts:detailed", account, { record ->
+                if (!record.succeeded()) {
+                    logger.error(record.cause())
                 }
-                if (transaction != null && !accountDto.transactions.contains(transaction)) {
-                    accountDto.transactions.add(transaction)
-                }
-                accountDto.amount = ethGetBalance.balance.toString()
-            } else {
-                val blocks = ArrayList<BigInteger>()
-                if (blockNumber != null) {
-                    blocks.add(blockNumber)
-                }
-                val transactions = ArrayList<TransactionDto>()
-                if (transaction != null) {
-                    transactions.add(transaction)
-                }
-                accountDto = AccountDto(account,
-                        ethGetBalance.balance.toString(),
-                        blocks,
-                        transactions,
-                        null,
-                        type,
-                        firstSeen)
+                // First get current balance
+                val ethGetBalance = web3Client.ethGetBalance(account, DefaultBlockParameterName.LATEST).sendAsync().get()
 
-                // Add to page only the first time
-                // TODO get criteria for the score
-                _redisClient.redis?.zadd("accounts:sorted", 1.toDouble(), accountDto.address, { zaddResult ->
-                    if (!zaddResult.succeeded()) {
-                        logger.error(zaddResult.cause())
+                val accountDto: AccountDto?
+                if (record.result() != null) {
+                    accountDto = gson.fromJson(record.result(), AccountDto::class.java)
+                    // We received a contract or already is a contract
+                    if ((type == "contract" && accountDto.type == "account") || (type == "account" && accountDto.type == "contract")) {
+                        logger.warn("collision with account $account")
+                    }
+                    if (blockNumber != null && !accountDto.blocksMined.contains(blockNumber)) {
+                        accountDto.blocksMined.add(blockNumber)
+                    }
+                    if (transaction != null && !accountDto.transactions.contains(transaction)) {
+                        accountDto.transactions.add(transaction)
+                    }
+                    accountDto.amount = ethGetBalance.balance.toString()
+                } else {
+                    val blocks = ArrayList<BigInteger>()
+                    if (blockNumber != null) {
+                        blocks.add(blockNumber)
+                    }
+                    val transactions = ArrayList<TransactionDto>()
+                    if (transaction != null) {
+                        transactions.add(transaction)
+                    }
+                    accountDto = AccountDto(account,
+                            ethGetBalance.balance.toString(),
+                            blocks,
+                            transactions,
+                            null,
+                            type,
+                            firstSeen)
+
+                    // Add to page only the first time
+                    // TODO get criteria for the score
+                    _redisClient.redis?.zadd("accounts:sorted", 1.toDouble(), accountDto.address, { zaddResult ->
+                        if (!zaddResult.succeeded()) {
+                            logger.error(zaddResult.cause())
+                        }
+                    })
+                }
+
+                // Save account object
+                _redisClient.redis?.hset("accounts:detailed", account, gson.toJson(accountDto), { hsetResult ->
+                    if (!hsetResult.succeeded()) {
+                        logger.error(hsetResult.cause())
                     }
                 })
-            }
-
-            // Save account object
-            _redisClient.redis?.hset("accounts:detailed", account, gson.toJson(accountDto), { hsetResult ->
-                if (!hsetResult.succeeded()) {
-                    logger.error(hsetResult.cause())
-                }
             })
         })
     }

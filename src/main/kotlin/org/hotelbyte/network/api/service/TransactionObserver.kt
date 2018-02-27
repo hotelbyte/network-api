@@ -19,7 +19,9 @@ class TransactionObserver(web3: Web3j, accountService: AccountService) {
             }
             val timestampBlock = web3.ethGetBlockByHash(x.blockHash, false).sendAsync().get().block.timestamp
             accountService.updateFromTransaction(x.from, x.hash, true, transactionReceipt, timestampBlock)
-            accountService.updateFromTransaction(x.to, x.hash, false, null, timestampBlock)
+            if (x.to != null) {
+                accountService.updateFromTransaction(x.to, x.hash, false, null, timestampBlock)
+            }
         })
 
         logger.info("Transaction observer started")
