@@ -80,7 +80,7 @@ open class AccountService(web3: Web3j) {
         val lastBlock = web3Client.ethBlockNumber().sendAsync().get()
 
         // Find all the transactions
-        web3Client.catchUpToLatestTransactionObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0))).subscribe({
+        web3Client.catchUpToLatestAndSubscribeToNewTransactionsObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0))).subscribe({
             try {
                 val txReceiptResult = web3Client.ethGetTransactionReceipt(it.hash).sendAsync().get()
                 var transactionReceipt: TransactionReceipt? = null
@@ -101,7 +101,7 @@ open class AccountService(web3: Web3j) {
         })
 
         // Find all the blocks
-        web3Client.catchUpToLatestBlockObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0)), false).subscribe({
+        web3Client.catchUpToLatestAndSubscribeToNewBlocksObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0)), false).subscribe({
             updateFromBlock(it.block)
 
             // Check if is the last block
