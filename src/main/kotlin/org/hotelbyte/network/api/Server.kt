@@ -44,7 +44,7 @@ class Server : io.vertx.core.AbstractVerticle()  {
 
         // Prepare async services
         val web3Service = GhbcService.Web3.get()
-        val accountService = AccountService(web3Service, RedisClientService(vertx))
+        val accountService = AccountService(web3Service)
 
         // Fire the observers and account finder
         BlockObserver(web3Service, accountService)

@@ -1,4 +1,7 @@
-
+out/
 .gradle/
 .idea/
 build/
+*.iml
+*.kt___jb_tmp___
+*.class

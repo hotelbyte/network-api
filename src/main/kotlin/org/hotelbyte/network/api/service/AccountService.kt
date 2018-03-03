@@ -5,6 +5,7 @@ import io.vertx.core.http.HttpServerResponse
 import org.hotelbyte.network.api.dto.AccountDto
 import org.hotelbyte.network.api.dto.TransactionDto
 import org.hotelbyte.network.api.params.Pages
+import org.litote.kmongo.*
 import org.web3j.protocol.Web3j
 import org.web3j.protocol.core.DefaultBlockParameter
 import org.web3j.protocol.core.DefaultBlockParameterName
@@ -19,15 +20,17 @@ import kotlin.collections.ArrayList
 /**
  * This service is used to keep updated the accounts of the network
  */
-open class AccountService(web3: Web3j, redisClient: RedisClientService) {
+open class AccountService(web3: Web3j) {
     private var logger = io.vertx.core.logging.LoggerFactory.getLogger(this.javaClass)
 
     private val web3Client = web3
-    private val _redisClient = redisClient
 
-    init {
-        _redisClient.connect()
-    }
+    data class Account(val _id: String, val detail: AccountDto)
+
+    private val client = KMongo.createClient()
+    private val database = client.getDatabase("network")
+    private val collection = database.getCollection<Account>()
+
 
     /**
      * Keeps mined blocks
@@ -47,7 +50,7 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
         val transaction = TransactionDto(hash, sender)
         updateAccountInfo(account, null, transaction, "account", firstSeen)
         if (transactionReceipt != null) {
-                if (transactionReceipt.contractAddress != null) {
+            if (transactionReceipt.contractAddress != null) {
                 // Save this address like a contract address
                 updateAccountInfo(transactionReceipt.contractAddress, null, transaction, "contract", firstSeen)
             }
@@ -83,8 +86,8 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
                     updateFromTransaction(it.to, it.hash, false, null, timestampBlock)
                 }
                 logTotalTime(now, it.blockNumber, lastBlock.blockNumber, "from transactions")
-            } catch (e:Exception) {
-                logger.error("Tx error: ",e)
+            } catch (e: Exception) {
+                logger.error("Tx error: ", e)
             }
         })
 
@@ -104,56 +107,37 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
      * Find account page from Redis
      */
     fun findAccountPage(pages: Pages, response: HttpServerResponse) {
-        synchronized(this, {
-            _redisClient.redis?.zrange("accounts:sorted", pages.from, pages.to, { asyncResult ->
-                if (!asyncResult.succeeded()) {
-                    logger.error(asyncResult.cause())
-                }
-                if (asyncResult.result() != null) {
-                    response.end(Gson().toJson(asyncResult.result()))
-                } else {
-                    response.end("[]")
-                }
-            })
-        })
+        val totalElements = pages.from - pages.to
+        val iterator = collection.find().skip(pages.from.toInt()).iterator()
+        var elements = 0
+        while (iterator.hasNext() && elements < totalElements) {
+            response.end(Gson().toJson(iterator.next().detail))
+            elements++
+        }
     }
 
     /**
      * Counts the sorted list
      */
     fun getTotal(response: HttpServerResponse) {
-        synchronized(this, {
-            _redisClient.redis?.zcount("accounts:sorted", Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, { asyncResult ->
-                if (!asyncResult.succeeded()) {
-                    logger.error(asyncResult.cause())
-                }
-
-                if (asyncResult.result() != null) {
-                    response.end(Gson().toJson(asyncResult.result()))
-                } else {
-                    response.end("[]")
-                }
-            })
-        })
+        var total = collection.count()
+        if (total != null) {
+            response.end(total.toString())
+        } else {
+            response.end("[]")
+        }
     }
 
     /**
      * Get a single account with details
      */
     fun getAccount(account: String, response: HttpServerResponse) {
-        synchronized(this, {
-            _redisClient.redis?.hget("accounts:detailed", account, { asyncResult ->
-                if (!asyncResult.succeeded()) {
-                    logger.error(asyncResult.cause())
-                }
-
-                if (asyncResult.result() != null) {
-                    response.end(asyncResult.result())
-                } else {
-                    response.end("[]")
-                }
-            })
-        })
+        val found = collection.findOne("{_id:${account.json}}")
+        if (found != null) {
+            response.end(Gson().toJson(found))
+        } else {
+            response.end("[]")
+        }
     }
 
     /**
@@ -168,64 +152,56 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
         synchronized(this, {
             val gson = Gson()
             // Find accountDto, add block mined and update balance
-            _redisClient.redis?.hget("accounts:detailed", account, { record ->
-                if (!record.succeeded()) {
-                    logger.error(record.cause())
+            val found = collection.findOne("{_id:${account.json}}")
+            val ethGetBalance = web3Client.ethGetBalance(account, DefaultBlockParameterName.LATEST).sendAsync().get()
+            val accountDto: AccountDto?
+            if (found != null) {
+                accountDto = found.detail
+                // We received a contract or already is a contract
+                if ((type == "contract" && accountDto.type == "account") || (type == "account" && accountDto.type == "contract")) {
+                    logger.warn("collision with account $account")
                 }
-                // First get current balance
-                val ethGetBalance = web3Client.ethGetBalance(account, DefaultBlockParameterName.LATEST).sendAsync().get()
-
-                val accountDto: AccountDto?
-                if (record.result() != null) {
-                    accountDto = gson.fromJson(record.result(), AccountDto::class.java)
-                    // We received a contract or already is a contract
-                    if ((type == "contract" && accountDto.type == "account") || (type == "account" && accountDto.type == "contract")) {
-                        logger.warn("collision with account $account")
-                    }
-                    if (blockNumber != null && !accountDto.blocksMined.contains(blockNumber)) {
-                        accountDto.blocksMined.add(blockNumber)
-                    }
-                    if (transaction != null && !accountDto.transactions.contains(transaction)) {
-                        accountDto.transactions.add(transaction)
-                    }
-                    accountDto.amount = ethGetBalance.balance.toString()
-                } else {
-                    val blocks = ArrayList<BigInteger>()
-                    if (blockNumber != null) {
-                        blocks.add(blockNumber)
-                    }
-                    val transactions = ArrayList<TransactionDto>()
-                    if (transaction != null) {
-                        transactions.add(transaction)
-                    }
-                    accountDto = AccountDto(account,
-                            ethGetBalance.balance.toString(),
-                            blocks,
-                            transactions,
-                            null,
-                            type,
-                            firstSeen)
-
-                    // Add to page only the first time
-                    // TODO get criteria for the score
-                    _redisClient.redis?.zadd("accounts:sorted", 1.toDouble(), accountDto.address, { zaddResult ->
-                        if (!zaddResult.succeeded()) {
-                            logger.error(zaddResult.cause())
-                        }
-                    })
+                if (blockNumber != null && !accountDto.blocksMined.contains(blockNumber)) {
+                    accountDto.blocksMined.add(blockNumber)
                 }
-
-                // Save account object
-                _redisClient.redis?.hset("accounts:detailed", account, gson.toJson(accountDto), { hsetResult ->
-                    if (!hsetResult.succeeded()) {
-                        logger.error(hsetResult.cause())
-                    }
-                })
-            })
+                if (transaction != null && !accountDto.transactions.contains(transaction)) {
+                    accountDto.transactions.add(transaction)
+                }
+                accountDto.amount = ethGetBalance.balance.toString()
+                collection.updateOneById(accountDto.address,Account(accountDto.address, accountDto))
+                if(logger.isDebugEnabled) {
+                    logger.debug("Updated account ${accountDto.address}")
+                }
+            }else{
+                val blocks = ArrayList<BigInteger>()
+                if (blockNumber != null) {
+                    blocks.add(blockNumber)
+                }
+                val transactions = ArrayList<TransactionDto>()
+                if (transaction != null) {
+                    transactions.add(transaction)
+                }
+                accountDto = AccountDto(account,
+                        ethGetBalance.balance.toString(),
+                        blocks,
+                        transactions,
+                        null,
+                        type,
+                        firstSeen)
+                // Add to page only the first time
+                collection.insertOne(Account(accountDto.address, accountDto))
+                if(logger.isDebugEnabled) {
+                    logger.info("New account ${accountDto.address}")
+                }
+            }
         })
     }
 
     private fun logTotalTime(startTime: LocalDateTime, blockNumber: BigInteger, lastBlockNumber: BigInteger, msg: String) {
+        if(blockNumber.toInt()%1000==0){
+            val total = Duration.between(startTime, LocalDateTime.now())
+            logger.info("Partial elapsed! Total time: $total $msg")
+        }
         if (blockNumber.compareTo(lastBlockNumber) == 0) {
             val total = Duration.between(startTime, LocalDateTime.now())
             logger.info("Account finder arrive to the last block, great! Total time: $total $msg")
