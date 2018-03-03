@@ -174,9 +174,10 @@ open class AccountService(web3: Web3j) {
         })
         synchronized(this, {
             var accountDto: AccountDto?
-            accountDto = accountCache.get(account, {
-                getAccountDto(account)
-            })
+            accountDto = accountCache.getIfPresent(account)
+            if (accountDto == null) {
+                accountDto = getAccountDto(account)
+            }
             if (accountDto != null) {
                 // We received a contract or already is a contract
                 if ((type == "contract" && accountDto.type == "account") || (type == "account" && accountDto.type == "contract")) {
