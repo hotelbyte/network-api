@@ -3,7 +3,7 @@ package org.hotelbyte.network.api.params
 /**
  * Pages to keep to and from values
  */
-data class Pages(val from:Long, val to:Long) {
+data class Pages(val skips: Int, val limit: Int) {
 
     /**
      * Page handler to help the page calculation from QueryParam
@@ -13,22 +13,20 @@ data class Pages(val from:Long, val to:Long) {
         /**
          * Calculates from and to
          */
-        fun pagination(queryParameters:Map<String,List<String>>):Pages {
+        fun pagination(queryParameters: Map<String, List<String>>): Pages {
 
             val pagNumber = getPageParam(queryParameters["page"])
             val pageSize = getPageParam(queryParameters["size"])
 
             // Calculate page values
-            val to = pagNumber * pageSize
-            val from = to.minus(pageSize)
-
-            return Pages(from,to.dec())
+            val skips = pageSize * (pagNumber - 1)
+            return Pages(skips, pageSize)
         }
 
-        private fun getPageParam(queryParam:List<String>?):Long {
-            var number = 0L
+        private fun getPageParam(queryParam: List<String>?): Int {
+            var number = 0
             if (queryParam != null) {
-                number = queryParam[0].toLong()
+                number = queryParam[0].toInt()
             }
             return number
         }

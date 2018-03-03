@@ -7,8 +7,8 @@ import java.math.BigInteger
  */
 data class AccountDto(val address: String,
                       var amount: String,
-                      val blocksMined: ArrayList<BigInteger>,
-                      val transactions: ArrayList<TransactionDto>,
+                      val blocksMined: LinkedHashSet<BigInteger>,
+                      val transactions: LinkedHashSet<TransactionDto>,
                       var tag:String?,
                       var type:String,
                       var firstSeen:BigInteger)

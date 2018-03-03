@@ -17,13 +17,13 @@ import java.net.URI
 /**
  * Main class
  */
-class Server : io.vertx.core.AbstractVerticle()  {
+class Server : io.vertx.core.AbstractVerticle() {
 
     private var logger = io.vertx.core.logging.LoggerFactory.getLogger(this.javaClass)
 
     companion object Routes {
-        const val account       = "/accounts/:account"
-        const val accounts      = "/accounts"
+        const val account = "/accounts/:account"
+        const val accounts = "/accounts"
         const val totalAccounts = "/accounts/total"
     }
 
@@ -77,7 +77,6 @@ class Server : io.vertx.core.AbstractVerticle()  {
             addResponseHeaders(routingContext, response)
 
             val pages = Pages.Handler.pagination(routingContext.request().queryParameters())
-            if (logger.isDebugEnabled) logger.debug("range to ${pages.to} from ${pages.from}")
             // Response end with page
             accountService.findAccountPage(pages, response)
         })
@@ -88,11 +87,11 @@ class Server : io.vertx.core.AbstractVerticle()  {
     /**
      * Override query parameters
      */
-    fun HttpServerRequest.queryParameters() : Map<String, List<String>> {
+    fun HttpServerRequest.queryParameters(): Map<String, List<String>> {
         val params = URLEncodedUtils.parse(URI(this.uri()), "UTF-8")
         val map = mutableMapOf<String, MutableList<String>>()
-        for(param in params){
-            if(map[param.name] == null){
+        for (param in params) {
+            if (map[param.name] == null) {
                 map[param.name] = mutableListOf()
             }
             map[param.name]?.add(param.value)
@@ -100,7 +99,7 @@ class Server : io.vertx.core.AbstractVerticle()  {
         return map
     }
 
-    private fun addResponseHeaders(routingContext:RoutingContext, response: HttpServerResponse) {
+    private fun addResponseHeaders(routingContext: RoutingContext, response: HttpServerResponse) {
         // Response always with JSON
         response.putHeader("content-type", routingContext.acceptableContentType)
         response.putHeader("Access-Control-Allow-Origin", "*")
