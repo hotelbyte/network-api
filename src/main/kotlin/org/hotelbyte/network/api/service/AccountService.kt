@@ -1,7 +1,7 @@
 package org.hotelbyte.network.api.service
 
+import com.google.common.cache.Cache
 import com.google.gson.Gson
-import com.mongodb.client.DistinctIterable
 import io.vertx.core.http.HttpServerResponse
 import org.hotelbyte.network.api.dto.AccountDto
 import org.hotelbyte.network.api.dto.TransactionDto
@@ -17,11 +17,12 @@ import org.web3j.protocol.core.DefaultBlockParameter
 import org.web3j.protocol.core.DefaultBlockParameterName
 import org.web3j.protocol.core.methods.response.EthBlock
 import org.web3j.protocol.core.methods.response.TransactionReceipt
-import java.lang.Exception
 import java.math.BigInteger
 import java.time.Duration
 import java.time.LocalDateTime
 import kotlin.collections.ArrayList
+import com.google.common.cache.CacheBuilder
+
 
 /**
  * This service is used to keep updated the accounts of the network
@@ -38,8 +39,9 @@ open class AccountService(web3: Web3j) {
     private val syncClient = org.litote.kmongo.KMongo.createClient()
     private val syncCollection = syncClient.getDatabase("network").getCollection<Account>()
 
+    private val accountCache: Cache<String, AccountDto> = CacheBuilder.newBuilder().maximumSize(100).build<String, AccountDto>()
+    private val balanceCache: Cache<String, BigInteger> = CacheBuilder.newBuilder().maximumSize(100).build<String, BigInteger>()
 
-    private var pendingCreation: HashSet<String> = hashSetOf()
 
     /**
      * Keeps mined blocks
@@ -78,9 +80,7 @@ open class AccountService(web3: Web3j) {
         val lastBlock = web3Client.ethBlockNumber().sendAsync().get()
 
         // Find all the transactions
-        web3Client.replayTransactionsObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0)),
-                DefaultBlockParameter.valueOf(lastBlock.blockNumber)).subscribe({
-
+        web3Client.catchUpToLatestTransactionObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0))).subscribe({
             try {
                 val txReceiptResult = web3Client.ethGetTransactionReceipt(it.hash).sendAsync().get()
                 var transactionReceipt: TransactionReceipt? = null
@@ -101,8 +101,7 @@ open class AccountService(web3: Web3j) {
         })
 
         // Find all the blocks
-        web3Client.replayBlocksObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0)),
-                DefaultBlockParameter.valueOf(lastBlock.blockNumber), false).subscribe({
+        web3Client.catchUpToLatestBlockObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0)), false).subscribe({
             updateFromBlock(it.block)
 
             // Check if is the last block
@@ -121,7 +120,7 @@ open class AccountService(web3: Web3j) {
             details.add(it.detail)
         }, { _, t ->
             if (t != null) {
-                logger.error("Error getting count", t);
+                logger.error("Error getting count", t)
             }
             response.end(Gson().toJson(details))
         })
@@ -133,7 +132,7 @@ open class AccountService(web3: Web3j) {
     fun getTotal(response: HttpServerResponse) {
         asyncCollection.count({ result, t ->
             if (t != null) {
-                logger.error("Error getting count", t);
+                logger.error("Error getting count", t)
             }
 
             if (result != null) {
@@ -150,65 +149,49 @@ open class AccountService(web3: Web3j) {
     fun getAccount(account: String, response: HttpServerResponse) {
         asyncCollection.findOne("{_id:${account.json}}", { result, t ->
             if (t != null) {
-                logger.error("Error getting one", t);
+                logger.error("Error getting one", t)
             }
-
             if (result != null) {
                 response.end(Gson().toJson(result))
             } else {
                 response.end("[]")
             }
-
-
         })
     }
 
+
     /**
-     * Updates the account with the last balance, transactions and blocks mined.
+     * Updates the account with the last balanceCache, transactions and blocks mined.
      */
     private fun updateAccountInfo(account: String,
                                   blockNumber: BigInteger?,
                                   transaction: TransactionDto?,
                                   type: String,
                                   firstSeen: BigInteger) {
+        // Find accountDto, add block mined and update balanceCache
+        val accountBalance = balanceCache.get(account, {
+            web3Client.ethGetBalance(account, DefaultBlockParameterName.LATEST).sendAsync().get().balance
+        })
         synchronized(this, {
-            var dbAccount: Account?
-            if (pendingCreation.contains(account)) {
-                val startTime = LocalDateTime.now()
-                do {
-                    dbAccount = syncCollection.findOne("{_id:${account.json}}")
-                } while (dbAccount == null)
-                val total = Duration.between(startTime, LocalDateTime.now())
-                if (logger.isDebugEnabled) {
-                    logger.debug("Blocked waiting for $account! Total time: $total")
-                }
-                pendingCreation.remove(account)
-            } else {
-                dbAccount = syncCollection.findOne("{_id:${account.json}}")
-            }
-
-            // Find accountDto, add block mined and update balance
-            val ethGetBalance = web3Client.ethGetBalance(account, DefaultBlockParameterName.LATEST).sendAsync().get()
-            val accountDto: AccountDto?
-            if (dbAccount != null) {
-                accountDto = dbAccount.detail
+            var accountDto: AccountDto?
+            accountDto = accountCache.get(account, {
+                getAccountDto(account)
+            })
+            if (accountDto != null) {
                 // We received a contract or already is a contract
                 if ((type == "contract" && accountDto.type == "account") || (type == "account" && accountDto.type == "contract")) {
                     logger.warn("collision with account $account")
                 }
-                if (blockNumber != null && !accountDto.blocksMined.contains(blockNumber)) {
+                if (blockNumber != null) {
                     accountDto.blocksMined.add(blockNumber)
                 }
-                if (transaction != null && !accountDto.transactions.contains(transaction)) {
+                if (transaction != null) {
                     accountDto.transactions.add(transaction)
                 }
-                accountDto.amount = ethGetBalance.balance.toString()
+                accountDto.amount = accountBalance.toString()
                 asyncCollection.updateOneById(accountDto.address, Account(accountDto.address, accountDto), { result, t ->
                     if (t != null) {
                         logger.error("Error update account", t);
-                    }
-                    if (logger.isDebugEnabled) {
-                        logger.debug("Updated account ${accountDto.address}: $result")
                     }
                 })
 
@@ -222,30 +205,36 @@ open class AccountService(web3: Web3j) {
                     transactions.add(transaction)
                 }
                 accountDto = AccountDto(account,
-                        ethGetBalance.balance.toString(),
+                        accountBalance.toString(),
                         blocks,
                         transactions,
                         null,
                         type,
                         firstSeen)
                 // Add to page only the first time
-                pendingCreation.add(accountDto.address)
                 asyncCollection.insertOne(Account(accountDto.address, accountDto), { result, t ->
                     if (t != null) {
                         logger.error("Error new account", t);
                     }
-                    if (logger.isDebugEnabled) {
-                        logger.debug("New account ${accountDto.address}: $result")
-                    }
                 })
             }
+            accountCache.put(account, accountDto)
         })
+    }
+
+    private fun getAccountDto(account: String): AccountDto? {
+        val dbAccount = syncCollection.findOne("{_id:${account.json}}")
+        if (dbAccount != null) {
+            return dbAccount.detail
+        } else {
+            return null
+        }
     }
 
     private fun logTotalTime(startTime: LocalDateTime, blockNumber: BigInteger, lastBlockNumber: BigInteger, msg: String) {
         if (blockNumber.toInt() % 10000 == 0) {
             val total = Duration.between(startTime, LocalDateTime.now())
-            logger.info("Partial elapsed $blockNumber! Total time: $total $msg")
+            logger.info("Partial elapsed $blockNumber/$lastBlockNumber! Total time: $total $msg")
         }
         if (blockNumber.compareTo(lastBlockNumber) == 0) {
             val total = Duration.between(startTime, LocalDateTime.now())
