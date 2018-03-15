@@ -1,18 +1,16 @@
 package org.hotelbyte.network.api
 
 import io.vertx.core.http.HttpMethod
-import io.vertx.core.http.HttpServerOptions
 import io.vertx.core.http.HttpServerRequest
 import io.vertx.core.http.HttpServerResponse
 import io.vertx.ext.web.Router
 import io.vertx.ext.web.RoutingContext
-import io.vertx.ext.web.handler.CorsHandler
-import io.vertx.kotlin.core.http.HttpServerOptions
 import nl.komponents.kovenant.task
 import org.apache.http.client.utils.URLEncodedUtils
 import org.hotelbyte.network.api.params.Pages
 import org.hotelbyte.network.api.service.*
 import java.net.URI
+import java.time.LocalDateTime
 
 /**
  * Main class
@@ -43,13 +41,18 @@ class Server : io.vertx.core.AbstractVerticle()  {
         // accountsRoute.handler(CorsHandler.create("explorer\\.hotelbyte\\.org").allowedMethod(HttpMethod.GET))
 
         // Prepare async services
+        logger.info("Server started at ${LocalDateTime.now()}")
         val web3Service = GhbcService.Web3.get()
         val accountService = AccountService(web3Service, RedisClientService(vertx))
 
         // Fire the observers and account finder
+        val sync = System.getProperty("sync")
+        if (sync != null) {
+            task { accountService.findAllAccountsFromBlocks() }
+        }
+
         BlockObserver(web3Service, accountService)
         TransactionObserver(web3Service, accountService)
-        task { accountService.findAllAccountsFromBlocks() }
 
         // Total accounts
         totalAccountsRoute.handler({ routingContext ->

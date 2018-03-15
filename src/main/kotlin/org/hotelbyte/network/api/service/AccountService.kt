@@ -3,18 +3,19 @@ package org.hotelbyte.network.api.service
 import com.google.gson.Gson
 import io.vertx.core.http.HttpServerResponse
 import org.hotelbyte.network.api.dto.AccountDto
+import org.hotelbyte.network.api.dto.ContractDto
 import org.hotelbyte.network.api.dto.TransactionDto
 import org.hotelbyte.network.api.params.Pages
 import org.web3j.protocol.Web3j
 import org.web3j.protocol.core.DefaultBlockParameter
 import org.web3j.protocol.core.DefaultBlockParameterName
 import org.web3j.protocol.core.methods.response.EthBlock
+import org.web3j.protocol.core.methods.response.EthBlockNumber
 import org.web3j.protocol.core.methods.response.TransactionReceipt
 import java.lang.Exception
 import java.math.BigInteger
 import java.time.Duration
 import java.time.LocalDateTime
-import kotlin.collections.ArrayList
 
 /**
  * This service is used to keep updated the accounts of the network
@@ -29,11 +30,16 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
         _redisClient.connect()
     }
 
+    companion object Accounts {
+        const val accountsSorted = "accounts:sorted"
+        const val accountsDetailed = "accounts:detailed"
+    }
+
     /**
      * Keeps mined blocks
      */
     fun updateFromBlock(block: EthBlock.Block) {
-        updateAccountInfo(block.miner, block.number, null, "account", block.timestamp)
+        updateAccountInfo(block.miner, block.number, null, null, "account", block.timestamp)
     }
 
     /**
@@ -44,60 +50,93 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
                               sender: Boolean,
                               transactionReceipt: TransactionReceipt?,
                               firstSeen: BigInteger) {
+
         val transaction = TransactionDto(hash, sender)
-        updateAccountInfo(account, null, transaction, "account", firstSeen)
+        // If we have receipt look for contract address
         if (transactionReceipt != null) {
-                if (transactionReceipt.contractAddress != null) {
-                // Save this address like a contract address
-                updateAccountInfo(transactionReceipt.contractAddress, null, transaction, "contract", firstSeen)
+            if (transactionReceipt.contractAddress != null) {
+                // Save this address like a contract address and link to sender address
+                val contractDto = ContractDto(transactionReceipt.contractAddress)
+                updateAccountInfo(account, null, transaction, contractDto, "account", firstSeen)
+                updateAccountInfo(transactionReceipt.contractAddress, null, transaction, null, "contract", firstSeen)
+            } else {
+                // We have a receipt OK but we don't have contract, save as is
+                updateAccountInfo(account, null, transaction, null, "account", firstSeen)
             }
+        } else {
+            // No receipt we have an unconfirmed transaction save it anyway
+            updateAccountInfo(account, null, transaction, null, "account", firstSeen)
         }
     }
 
     /**
-     * Async task to find all the accounts of the network
-     * TODO create method to check the last sync avoid full sync again
+     * Task to find all the accounts of the network
+     * Async call
      */
     fun findAllAccountsFromBlocks() {
-
-        val now = LocalDateTime.now()
-
-        // Get last block number
+        val startBlock = BigInteger.valueOf(0)
+        val endBlock = BigInteger.valueOf(10000)
+        // Find max block for data look up
         val lastBlock = web3Client.ethBlockNumber().sendAsync().get()
+        // Fire replay block finder
+        findBlockByBatch(startBlock, endBlock, lastBlock)
+        logger.info("Account finder started at $startBlock to $endBlock with max ${lastBlock.blockNumber}")
+    }
 
-        // Find all the transactions
-        web3Client.replayTransactionsObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0)),
-                DefaultBlockParameter.valueOf(lastBlock.blockNumber)).subscribe({
+    /**
+     * TODO add Datadog?
+     */
+    private fun findBlockByBatch(startBlockNumber: BigInteger, endBlockNumber: BigInteger, lastBlock: EthBlockNumber) {
+        val startTime = LocalDateTime.now()
+        // Find all the blocks
+        web3Client.replayBlocksObservable(DefaultBlockParameter.valueOf(startBlockNumber),
+                DefaultBlockParameter.valueOf(endBlockNumber), true, true).subscribe({
+            if (it != null && it.block != null) {
+                try {
+                    // Miner
+                    updateFromBlock(it.block)
 
-            try {
-                val txReceiptResult = web3Client.ethGetTransactionReceipt(it.hash).sendAsync().get()
-                var transactionReceipt: TransactionReceipt? = null
-                if (txReceiptResult != null && txReceiptResult.transactionReceipt != null) {
-                    transactionReceipt = txReceiptResult.transactionReceipt.get()
+                    // Senders and receivers
+                    if (it.block.transactions != null && it.block.transactions.size > 0) {
+                        it.block.transactions.forEach({ tx ->
+                            val txObject = tx.get()
+                            if (txObject is EthBlock.TransactionObject) {
+                                // Find receipt
+                                val txReceiptResult = web3Client.ethGetTransactionReceipt(txObject.hash).sendAsync().get()
+                                var transactionReceipt: TransactionReceipt? = null
+                                if (txReceiptResult != null && txReceiptResult.transactionReceipt != null) {
+                                    transactionReceipt = txReceiptResult.transactionReceipt.get()
+                                }
+                                // Get timestamp block
+                                val timestampBlock = it.block.timestamp
+                                // pass receipt only with the sender of the transaction
+                                updateFromTransaction(txObject.from, txObject.hash, true, transactionReceipt, timestampBlock)
+                                if (txObject.to != null) {
+                                    updateFromTransaction(txObject.to, txObject.hash, false, null, timestampBlock)
+                                }
+                            }
+                        })
+                    }
+                } catch (e: Exception) {
+                    logger.error("Replay block ", e)
                 }
 
-                val timestampBlock = web3Client.ethGetBlockByHash(it.blockHash, false).sendAsync().get().block.timestamp
-                // pass receipt only with the sender of the transaction
-                updateFromTransaction(it.from, it.hash, true, transactionReceipt, timestampBlock)
-                if (it.to != null) {
-                    updateFromTransaction(it.to, it.hash, false, null, timestampBlock)
+                // Check if is the last block
+                if (it.block.number.compareTo(endBlockNumber) == 0 && it.block.number.compareTo(lastBlock.blockNumber) == -1) {
+                    val total = Duration.between(startTime, LocalDateTime.now())
+                    val nextStart = endBlockNumber.plus(BigInteger.valueOf(1))
+                    val nextEnd = endBlockNumber.plus(BigInteger.valueOf(10000))
+                    logger.info("Spent $total starting at $nextStart to $nextEnd ")
+                    findBlockByBatch(nextStart, nextEnd, lastBlock)
                 }
-                logTotalTime(now, it.blockNumber, lastBlock.blockNumber, "from transactions")
-            } catch (e:Exception) {
-                logger.error("Tx error: ",e)
+
+                if (it.block.number.compareTo(lastBlock.blockNumber) == 0) {
+                    logger.info("Full scan of blockchain done!")
+                }
+            } else {
+                logger.error("Something is wrong block is null")
             }
         })
-
-        // Find all the blocks
-        web3Client.replayBlocksObservable(DefaultBlockParameter.valueOf(BigInteger.valueOf(0)),
-                DefaultBlockParameter.valueOf(lastBlock.blockNumber), false).subscribe({
-            updateFromBlock(it.block)
-
-            // Check if is the last block
-            logTotalTime(now, it.block.number, lastBlock.blockNumber, "from blocks")
-        })
-
-        logger.info("Job account finder started")
     }
 
     /**
@@ -105,14 +144,14 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
      */
     fun findAccountPage(pages: Pages, response: HttpServerResponse) {
         synchronized(this, {
-            _redisClient.redis?.zrange("accounts:sorted", pages.from, pages.to, { asyncResult ->
+            _redisClient.redis?.zrange(AccountService.Accounts.accountsSorted, pages.from, pages.to, { asyncResult ->
                 if (!asyncResult.succeeded()) {
                     logger.error(asyncResult.cause())
                 }
                 if (asyncResult.result() != null) {
                     response.end(Gson().toJson(asyncResult.result()))
                 } else {
-                    response.end("[]")
+                    response.end("{[]}")
                 }
             })
         })
@@ -123,7 +162,7 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
      */
     fun getTotal(response: HttpServerResponse) {
         synchronized(this, {
-            _redisClient.redis?.zcount("accounts:sorted", Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, { asyncResult ->
+            _redisClient.redis?.zcount(AccountService.Accounts.accountsSorted, Double.NEGATIVE_INFINITY, Double.POSITIVE_INFINITY, { asyncResult ->
                 if (!asyncResult.succeeded()) {
                     logger.error(asyncResult.cause())
                 }
@@ -131,7 +170,7 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
                 if (asyncResult.result() != null) {
                     response.end(Gson().toJson(asyncResult.result()))
                 } else {
-                    response.end("[]")
+                    response.end("{[]}")
                 }
             })
         })
@@ -142,15 +181,15 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
      */
     fun getAccount(account: String, response: HttpServerResponse) {
         synchronized(this, {
-            _redisClient.redis?.hget("accounts:detailed", account, { asyncResult ->
+            _redisClient.redis?.hget(AccountService.Accounts.accountsDetailed, account, { asyncResult ->
                 if (!asyncResult.succeeded()) {
                     logger.error(asyncResult.cause())
                 }
 
                 if (asyncResult.result() != null) {
-                    response.end(asyncResult.result())
+                    response.end(Gson().toJson(asyncResult.result()))
                 } else {
-                    response.end("[]")
+                    response.end("{[]}")
                 }
             })
         })
@@ -162,73 +201,123 @@ open class AccountService(web3: Web3j, redisClient: RedisClientService) {
     private fun updateAccountInfo(account: String,
                                   blockNumber: BigInteger?,
                                   transaction: TransactionDto?,
+                                  contract: ContractDto?,
                                   type: String,
                                   firstSeen: BigInteger) {
 
+        val redis = _redisClient.redis
+
+        // Save account object in Redis
         synchronized(this, {
-            val gson = Gson()
-            // Find accountDto, add block mined and update balance
-            _redisClient.redis?.hget("accounts:detailed", account, { record ->
-                if (!record.succeeded()) {
-                    logger.error(record.cause())
-                }
-                // First get current balance
-                val ethGetBalance = web3Client.ethGetBalance(account, DefaultBlockParameterName.LATEST).sendAsync().get()
+            // Find account on local hash map and create the first entry with zadd on Redis
+            val accountDtoFromLocal = findOrCreateAccountDtoFromHashMap(account, type, blockNumber,
+                    transaction, contract, firstSeen)
 
-                val accountDto: AccountDto?
-                if (record.result() != null) {
-                    accountDto = gson.fromJson(record.result(), AccountDto::class.java)
-                    // We received a contract or already is a contract
-                    if ((type == "contract" && accountDto.type == "account") || (type == "account" && accountDto.type == "contract")) {
-                        logger.warn("collision with account $account")
+            redis?.transaction()?.hexists(Accounts.accountsDetailed, account, {
+                if (it.succeeded()) {
+                    if (it.result() == "1") {
+                        redis.hget(Accounts.accountsDetailed, account, {
+                            if (it.succeeded()) {
+                                if (it.result() != null) {
+                                    val accountDto = Gson().fromJson(it.result(), AccountDto::class.java)
+
+                                    // Merge remote with local
+                                    if (accountDtoFromLocal != null) {
+                                        var update = false
+                                        if (!accountDto.transactions.isEmpty()) {
+                                            accountDto.transactions.forEach {
+                                                if (!accountDtoFromLocal.transactions.contains(it)) {
+                                                    accountDtoFromLocal.transactions.add(it)
+                                                    update = true
+                                                }
+                                            }
+                                        } else {
+                                            // we don't have remote transactions check local transactions
+                                            update = !accountDtoFromLocal.transactions.isEmpty()
+                                        }
+                                        if (!accountDto.blocksMined.isEmpty()) {
+                                            accountDto.blocksMined.forEach {
+                                                if (!accountDtoFromLocal.blocksMined.contains(it)) {
+                                                    accountDtoFromLocal.blocksMined.add(it)
+                                                    update = true
+                                                }
+                                            }
+                                        } else {
+                                            update = !accountDtoFromLocal.blocksMined.isEmpty()
+                                        }
+                                        if (accountDtoFromLocal.firstSeen.compareTo(accountDto.firstSeen) == 1) {
+                                            accountDtoFromLocal.firstSeen = accountDto.firstSeen
+                                            update = true
+                                        }
+                                        if (update) {
+                                            hset(accountDtoFromLocal)
+                                        }
+                                    } else {
+                                        logger.warn("Local account is null, it's impossible")
+                                    }
+                                } else {
+                                    logger.warn("Exist OK, but hget NOT $account")
+                                }
+                            } else {
+                                logger.error(it.cause())
+                            }
+                        })
+                    } else {
+                        // Add to page only the first time
+                        // TODO get criteria for the score
+                        _redisClient.redis?.zadd(Accounts.accountsSorted, 1.toDouble(), accountDtoFromLocal?.address, { zaddResult ->
+                            if (!zaddResult.succeeded()) {
+                                logger.error(zaddResult.cause())
+                            }
+                        })
+                        hset(accountDtoFromLocal)
                     }
-                    if (blockNumber != null && !accountDto.blocksMined.contains(blockNumber)) {
-                        accountDto.blocksMined.add(blockNumber)
-                    }
-                    if (transaction != null && !accountDto.transactions.contains(transaction)) {
-                        accountDto.transactions.add(transaction)
-                    }
-                    accountDto.amount = ethGetBalance.balance.toString()
                 } else {
-                    val blocks = ArrayList<BigInteger>()
-                    if (blockNumber != null) {
-                        blocks.add(blockNumber)
-                    }
-                    val transactions = ArrayList<TransactionDto>()
-                    if (transaction != null) {
-                        transactions.add(transaction)
-                    }
-                    accountDto = AccountDto(account,
-                            ethGetBalance.balance.toString(),
-                            blocks,
-                            transactions,
-                            null,
-                            type,
-                            firstSeen)
-
-                    // Add to page only the first time
-                    // TODO get criteria for the score
-                    _redisClient.redis?.zadd("accounts:sorted", 1.toDouble(), accountDto.address, { zaddResult ->
-                        if (!zaddResult.succeeded()) {
-                            logger.error(zaddResult.cause())
-                        }
-                    })
+                    logger.error(it.cause())
                 }
-
-                // Save account object
-                _redisClient.redis?.hset("accounts:detailed", account, gson.toJson(accountDto), { hsetResult ->
-                    if (!hsetResult.succeeded()) {
-                        logger.error(hsetResult.cause())
-                    }
-                })
             })
         })
     }
 
-    private fun logTotalTime(startTime: LocalDateTime, blockNumber: BigInteger, lastBlockNumber: BigInteger, msg: String) {
-        if (blockNumber.compareTo(lastBlockNumber) == 0) {
-            val total = Duration.between(startTime, LocalDateTime.now())
-            logger.info("Account finder arrive to the last block, great! Total time: $total $msg")
+    private fun hset(accountDto: AccountDto?) {
+        synchronized(this, {
+            val json = Gson().toJson(accountDto)
+            _redisClient.redis?.hset(Accounts.accountsDetailed, accountDto?.address, json, { hsetResult ->
+                if (!hsetResult.succeeded()) {
+                    logger.error(hsetResult.cause())
+                }
+            })
+        })
+    }
+
+    /**
+     * Find an account inside the local concurrent hash map
+     */
+    private fun findOrCreateAccountDtoFromHashMap(account: String, type: String, blockNumber: BigInteger?,
+                                                  transaction: TransactionDto?, contract: ContractDto?, firstSeen: BigInteger): AccountDto? {
+        var accountDto: AccountDto?
+        val blocks = ArrayList<BigInteger>()
+        if (blockNumber != null) {
+            blocks.add(blockNumber)
         }
+        val transactions = ArrayList<TransactionDto>()
+        if (transaction != null) {
+            transactions.add(transaction)
+        }
+        val contracts = ArrayList<ContractDto>()
+        if (contract != null) {
+            contracts.add(contract)
+        }
+        val ethGetBalance = web3Client.ethGetBalance(account, DefaultBlockParameterName.LATEST).sendAsync().get()
+        accountDto = AccountDto(account,
+                ethGetBalance.balance.toString(),
+                blocks,
+                transactions,
+                contracts,
+                null,
+                type,
+                firstSeen)
+
+        return accountDto
     }
 }

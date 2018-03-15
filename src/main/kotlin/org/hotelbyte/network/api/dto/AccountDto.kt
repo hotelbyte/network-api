@@ -9,6 +9,7 @@ data class AccountDto(val address: String,
                       var amount: String,
                       val blocksMined: ArrayList<BigInteger>,
                       val transactions: ArrayList<TransactionDto>,
+                      val contracts: ArrayList<ContractDto>?,
                       var tag:String?,
                       var type:String,
                       var firstSeen:BigInteger)
